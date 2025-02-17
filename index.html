@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Control MIDI con Detección de Formas y Modos Griegos</title>
+  <style>
+    /* Estilos para centrar y mejorar la apariencia */
+    body {
+      margin: 0;
+      padding: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      background-color: #f0f0f0;
+    }
+    #container {
+      width: 90%;
+      max-width: 900px;
+      text-align: center;
+      background: #fff;
+      padding: 20px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+      border-radius: 8px;
+    }
+    h1 {
+      margin-bottom: 10px;
+    }
+    canvas {
+      border: 1px solid #ccc;
+      margin-top: 10px;
+      border-radius: 4px;
+    }
+    video {
+      display: none;
+    }
+    #controls {
+      margin-top: 15px;
+    }
+    button {
+      padding: 10px 20px;
+      margin: 5px;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      background-color: #007BFF;
+      color: #fff;
+      border-radius: 4px;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    select {
+      padding: 5px;
+      font-size: 16px;
+      margin: 0 5px;
+    }
+    #status {
+      margin-top: 10px;
+      font-weight: bold;
+    }
+  </style>
+  <!-- Se incluye OpenCV.js (puede tardar en cargar) -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();" type="text/javascript"></script>
+</head>
+<body>
+  <div id="container">
+    <h1>Control MIDI con Detección de Formas y Modos Griegos</h1>
+    
+    <!-- Elementos de video y canvas -->
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    
+    <!-- Controles: tonalidad, modo, y botones de inicio/detención -->
+    <div id="controls">
+      <label for="rootNote">Tonalidad (Raíz): </label>
+      <select id="rootNote">
+        <option value="60">Do (C)</option>
+        <option value="62">Re (D)</option>
+        <option value="64">Mi (E)</option>
+        <option value="65">Fa (F)</option>
+        <option value="67">Sol (G)</option>
+        <option value="69">La (A)</option>
+        <option value="71">Si (B)</option>
+      </select>
+      <br><br>
+      <label for="scaleType">Modo: </label>
+      <select id="scaleType">
+        <option value="ionian">Ionian (Mayor)</option>
+        <option value="dorian">Dórico</option>
+        <option value="phrygian">Frigio</option>
+        <option value="lydian">Lidio</option>
+        <option value="mixolydian">Mixolidio</option>
+        <option value="aeolian">Eólico (Menor)</option>
+        <option value="locrian">Locrio</option>
+      </select>
+      <br><br>
+      <button id="startBtn">Inicio</button>
+      <button id="stopBtn">Detención</button>
+    </div>
+    
+    <div id="status">Cargando OpenCV...</div>
+  </div>
+
+  <script>
+    // Variable para saber si OpenCV.js está listo
+    let cvReady = false;
+    function onOpenCvReady() {
+      cvReady = true;
+      document.getElementById("status").innerText = "OpenCV cargado.";
+      console.log("OpenCV.js está listo.");
+    }
+
+    // Elementos de la página
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const statusDiv = document.getElementById('status');
+
+    // Configuración de los modos griegos (patrones en semitonos)
+    const modes = {
+      ionian:     [0, 2, 4, 5, 7, 9, 11],
+      dorian:     [0, 2, 3, 5, 7, 9, 10],
+      phrygian:   [0, 1, 3, 5, 7, 8, 10],
+      lydian:     [0, 2, 4, 6, 7, 9, 11],
+      mixolydian: [0, 2, 4, 5, 7, 9, 10],
+      aeolian:    [0, 2, 3, 5, 7, 8, 10],
+      locrian:    [0, 1, 3, 5, 6, 8, 10]
+    };
+
+    // Variables para la detección/calibración de formas
+    let calibratedNoteShape = null;   // { vertices: número }
+    let calibratedVolumeShape = null;
+
+    // Variables de procesamiento y MIDI
+    let processingIntervalID;
+    let currentMIDINote = null;
+    let midiAccess = null;
+    let midiOutput = null;
+    const MIN_MIDI_NOTE = 36; // C2
+    const MAX_MIDI_NOTE = 96; // C7
+
+    /**
+     * Función que mapea la posición vertical (y) a una nota MIDI
+     * utilizando la tonalidad (rootNote) y el modo (scaleType) seleccionados.
+     * Se construye la escala a partir del patrón y se elige la nota según la posición.
+     */
+    function mapYToNote(y) {
+      const rootNote = parseInt(document.getElementById('rootNote').value);
+      const scaleType = document.getElementById('scaleType').value;
+      const pattern = modes[scaleType];
+      let scaleNotes = [];
+      for (let note = MIN_MIDI_NOTE; note <= MAX_MIDI_NOTE; note++) {
+        let degree = (note - rootNote) % 12;
+        if (degree < 0) degree += 12;
+        if (pattern.includes(degree)) {
+          scaleNotes.push(note);
+        }
+      }
+      let index = Math.floor((1 - y / canvas.height) * scaleNotes.length);
+      if (index < 0) index = 0;
+      if (index >= scaleNotes.length) index = scaleNotes.length - 1;
+      return scaleNotes[index];
+    }
+
+    /**
+     * Función que mapea la posición vertical (y) a un valor de volumen (0-127).
+     * Mientras más arriba, mayor el volumen.
+     */
+    function mapYToVolume(y) {
+      let vol = Math.floor((1 - y / canvas.height) * 127);
+      return Math.min(Math.max(vol, 0), 127);
+    }
+
+    /**
+     * Dibuja en el canvas el contorno aproximado de una forma (polígono)
+     * con el color indicado.
+     */
+    function drawContour(approx, color) {
+      ctx.beginPath();
+      const vertices = approx.rows;
+      const data = approx.data32S;
+      if (vertices > 0) {
+        ctx.moveTo(data[0], data[1]);
+        for (let j = 1; j < vertices; j++) {
+          ctx.lineTo(data[j * 2], data[j * 2 + 1]);
+        }
+        ctx.closePath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+    }
+
+    /**
+     * Función para calibrar una forma (Nota o Volumen) usando OpenCV.js.
+     * Se captura una región central de 100x100 píxeles y se busca el contorno de mayor área.
+     */
+    function calibrateShape(option) {
+      let accepted = false;
+      let shapeInfo = null;
+      const regionWidth = 100, regionHeight = 100;
+      const startX = Math.floor((canvas.width - regionWidth) / 2);
+      const startY = Math.floor((canvas.height - regionHeight) / 2);
+      while (!accepted) {
+        alert("Coloca la forma deseada para " + option + " en el centro y presiona OK para capturar.");
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        let imageData = ctx.getImageData(startX, startY, regionWidth, regionHeight);
+        let src = cv.matFromImageData(imageData);
+        let gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+        let thresh = new cv.Mat();
+        cv.threshold(gray, thresh, 100, 255, cv.THRESH_BINARY_INV);
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        let maxArea = 0;
+        let maxContour = null;
+        for (let i = 0; i < contours.size(); i++) {
+          let cnt = contours.get(i);
+          let area = cv.contourArea(cnt);
+          if (area > maxArea) {
+            maxArea = area;
+            maxContour = cnt;
+          }
+        }
+        if (maxContour) {
+          let approx = new cv.Mat();
+          cv.approxPolyDP(maxContour, approx, 0.02 * cv.arcLength(maxContour, true), true);
+          let vertices = approx.rows; // número de vértices
+          shapeInfo = { vertices: vertices };
+          approx.delete();
+        } else {
+          alert("No se detectó ninguna forma. Vuelve a intentarlo.");
+          shapeInfo = null;
+        }
+        src.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete();
+        accepted = shapeInfo ? confirm("La forma detectada para " + option + " tiene " + shapeInfo.vertices + " vértices. ¿Deseas usar esta forma?") : false;
+      }
+      return shapeInfo;
+    }
+
+    /**
+     * Procesa cada frame: detecta formas en la imagen completa,
+     * dibuja los contornos y muestra los valores mapeados (nota y volumen) en el canvas.
+     * Además, envía los mensajes MIDI correspondientes.
+     */
+    function processFrame() {
+      if (video.videoWidth === 0 || video.videoHeight === 0) return;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      let src = cv.imread(canvas);
+      let gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      let thresh = new cv.Mat();
+      cv.threshold(gray, thresh, 100, 255, cv.THRESH_BINARY_INV);
+      let contours = new cv.MatVector();
+      let hierarchy = new cv.Mat();
+      cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      
+      let noteCentroid = null;
+      let volumeCentroid = null;
+      let mappedNote = null;
+      let mappedVolume = null;
+      
+      for (let i = 0; i < contours.size(); i++) {
+        let cnt = contours.get(i);
+        let approx = new cv.Mat();
+        cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
+        let vertices = approx.rows;
+        let moments = cv.moments(cnt);
+        if (moments.m00 === 0) { 
+          approx.delete(); 
+          continue; 
+        }
+        let cx = moments.m10 / moments.m00;
+        let cy = moments.m01 / moments.m00;
+        
+        // Detección de la forma para Nota (rojo)
+        if (calibratedNoteShape && Math.abs(vertices - calibratedNoteShape.vertices) <= 1) {
+          noteCentroid = { x: cx, y: cy };
+          mappedNote = mapYToNote(cy);
+          drawContour(approx, 'red');
+          ctx.beginPath();
+          ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+          ctx.fillStyle = 'red';
+          ctx.fill();
+          ctx.font = "16px Arial";
+          ctx.fillText("Nota: " + mappedNote, cx + 10, cy);
+        }
+        // Detección de la forma para Volumen (azul)
+        if (calibratedVolumeShape && Math.abs(vertices - calibratedVolumeShape.vertices) <= 1) {
+          volumeCentroid = { x: cx, y: cy };
+          mappedVolume = mapYToVolume(cy);
+          drawContour(approx, 'blue');
+          ctx.beginPath();
+          ctx.arc(cx, cy, 5, 0, 2 * Math.PI);
+          ctx.fillStyle = 'blue';
+          ctx.fill();
+          ctx.font = "16px Arial";
+          ctx.fillText("Vol: " + mappedVolume, cx + 10, cy);
+        }
+        approx.delete();
+        cnt.delete();
+      }
+      src.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete();
+
+      // Envío de mensajes MIDI según la forma para Nota y Volumen
+      if (mappedNote !== null && midiOutput) {
+        if (currentMIDINote !== mappedNote) {
+          if (currentMIDINote !== null) {
+            midiOutput.send([0x80, currentMIDINote, 0]); // Note Off de la nota anterior
+          }
+          currentMIDINote = mappedNote;
+          let velocity = mappedVolume !== null ? mappedVolume : 100;
+          midiOutput.send([0x90, currentMIDINote, velocity]); // Note On
+        } else {
+          if (mappedVolume !== null) {
+            midiOutput.send([0xB0, 7, mappedVolume]); // Actualiza volumen vía CC
+          }
+        }
+      }
+    }
+
+    // Inicia la cámara, calibra las formas y comienza el procesamiento
+    function startCamera() {
+      navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+        .then(function (stream) {
+          video.srcObject = stream;
+          video.play();
+          video.addEventListener("canplay", function () {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            if (!cvReady) {
+              alert("OpenCV aún no está listo, inténtalo de nuevo en unos segundos.");
+              return;
+            }
+            calibratedNoteShape = calibrateShape("Nota");
+            calibratedVolumeShape = calibrateShape("Volumen");
+            alert("Calibración completada.");
+            startProcessing();
+          }, { once: true });
+        })
+        .catch(function (err) {
+          console.error("Error al acceder a la cámara: " + err);
+          statusDiv.innerText = "Error al acceder a la cámara.";
+        });
+    }
+
+    function startProcessing() {
+      processingIntervalID = setInterval(processFrame, 50); // ~20 fps
+    }
+    function stopProcessing() {
+      clearInterval(processingIntervalID);
+      if (currentMIDINote !== null && midiOutput) {
+        midiOutput.send([0x80, currentMIDINote, 0]);
+        currentMIDINote = null;
+      }
+    }
+
+    // Configuración de la Web MIDI API
+    function onMIDISuccess(midi) {
+      midiAccess = midi;
+      const outputs = Array.from(midiAccess.outputs.values());
+      if (outputs.length > 0) {
+        midiOutput = outputs[0];
+        statusDiv.innerText = "MIDI conectado: " + midiOutput.name;
+      } else {
+        statusDiv.innerText = "No se encontró salida MIDI.";
+      }
+    }
+    function onMIDIFailure() {
+      console.error("Fallo al acceder a MIDI.");
+      statusDiv.innerText = "Fallo al acceder a MIDI.";
+    }
+    if (navigator.requestMIDIAccess) {
+      navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
+    } else {
+      statusDiv.innerText = "El navegador no soporta MIDI.";
+    }
+
+    // Eventos de los botones
+    document.getElementById('startBtn').addEventListener('click', function () {
+      startCamera();
+    });
+    document.getElementById('stopBtn').addEventListener('click', function () {
+      stopProcessing();
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach(track => track.stop());
+      }
+    });
+  </script>
+</body>
+</html>
